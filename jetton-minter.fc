@@ -1,0 +1,151 @@
+#pragma version >=0.4.3;
+
+#include "stdlib.fc";
+#include "op-codes.fc";
+
+struct JettonWalletData {
+    balance: Int;
+    owner: Address;
+    master: Address;
+    walletCode: Cell;
+}
+
+message(0xf8a7ea5) TokenTransfer {
+    queryId: Int as uint64;
+    amount: Int as coins;
+    destination: Address;
+    response_destination: Address;
+    custom_payload: Cell?;
+    forward_ton_amount: Int as coins;
+    forward_payload: Slice as remaining;
+}
+
+message(0x178d4519) TokenTransferInternal {
+    queryId: Int as uint64;
+    amount: Int as coins;
+    from: Address;
+    response_destination: Address;
+    forward_ton_amount: Int as coins;
+    forward_payload: Slice as remaining;
+}
+
+message(0x7362d09c) TokenNotification {
+    queryId: Int as uint64;
+    amount: Int as coins;
+    from: Address;
+    forward_payload: Slice as remaining;
+}
+
+message(0x595f07bc) TokenBurn {
+    queryId: Int as uint64;
+    amount: Int as coins;
+    owner: Address;
+    response_destination: Address;
+}
+
+message(0x7bdd97de) TokenBurnNotification {
+    queryId: Int as uint64;
+    amount: Int as coins;
+    owner: Address;
+    response_destination: Address?;
+}
+
+message(0xd53276db) TokenExcesses {
+    queryId: Int as uint64;
+}
+
+message TokenUpdateContent {
+    content: Cell;
+}
+
+contract JettonWallet {
+    var balance: Int;
+    var owner: Address;
+    var master: Address;
+    var minTonsForStorage: Int;
+    var gasConsumption: Int;
+
+    () init() {
+        self.balance = 0;
+        self.minTonsForStorage = 1000000; // 0.001 TON
+        self.gasConsumption = 100000; // 0.0001 TON
+    }
+
+    () check_owner() inline {
+        require(ctx.sender == self.owner, "Invalid sender");
+    }
+
+    receive(msg: TokenTransfer) {
+        let ctx: Context = context();
+        check_owner();
+
+        self.balance = self.balance - msg.amount;
+        require(self.balance >= 0, "Insufficient balance");
+
+        send(SendParameters {
+            to: msg.destination,
+            value: 0,
+            mode: SendRemainingValue,
+            bounce: true,
+            body: TokenNotification {
+                queryId: msg.queryId,
+                amount: msg.amount,
+                from: ctx.sender,
+                forward_payload: msg.forward_payload
+            }.toCell()
+        });
+
+        if (msg.response_destination != null) {
+            send(SendParameters {
+                to: msg.response_destination,
+                value: ctx.value,
+                bounce: false,
+                body: TokenExcesses {
+                    queryId: msg.queryId
+                }.toCell(),
+                mode: SendIgnoreErrors
+            });
+        }
+    }
+
+    receive(msg: TokenBurn) {
+        let ctx: Context = context();
+        check_owner();
+
+        self.balance = self.balance - msg.amount;
+        require(self.balance >= 0, "Insufficient balance");
+
+        let fwdFee: Int = ctx.readForwardFee();
+        require(ctx.value > fwdFee + 2 * self.gasConsumption + self.minTonsForStorage, "Invalid value - Burn");
+
+        send(SendParameters {
+            to: self.master,
+            value: 0,
+            mode: SendRemainingValue,
+            bounce: true,
+            body: TokenBurnNotification {
+                queryId: msg.queryId,
+                amount: msg.amount,
+                owner: self.owner,
+                response_destination: self.owner
+            }.toCell()
+        });
+    }
+
+    bounced(src: bounced<TokenTransferInternal>) {
+        self.balance = self.balance + src.amount;
+    }
+
+    bounced(src: bounced<TokenBurnNotification>) {
+        self.balance = self.balance + src.amount;
+    }
+
+    get fun get_wallet_data(): JettonWalletData {
+        return JettonWalletData {
+            balance: self.balance,
+            owner: self.owner,
+            master: self.master,
+            walletCode: (initOf JettonDefaultWallet(self.master, self.owner)).code
+        };
+    }
+}
